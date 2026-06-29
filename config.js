@@ -1,11 +1,26 @@
-// FitTrack — shared key config (optional)
+// ════════════════════════════════════════════════════════════════
+//  FitTrack configuration  (edit this file in your GitHub repo)
+// ════════════════════════════════════════════════════════════════
 //
-// Leave this as-is if every user enters their own Gemini key.
+// Everything here is OPTIONAL. The app works locally with no config.
+// Fill these in to enable shared features. The app's owner generates
+// each value from inside the app (AI settings / Shared storage pages)
+// and pastes the result here.
 //
-// To let OTHER people use YOUR Gemini key with an access code:
-//   1. Open the app → AI settings → "Owner: share your key" → Set up sharing
-//   2. Enter your Gemini key + choose an access code → Generate shared config
-//   3. Copy the generated line and PASTE IT BELOW, replacing this whole file's contents
-//   4. Commit the change. Now anyone who opens the app can enter the access code to unlock AI.
-//
-window.FITTRACK_SHARED = { blob: "" };
+window.FITTRACK_CONFIG = {
+
+  // 1) SHARED GEMINI KEY (so users don't need their own AI key)
+  //    Generated in: AI settings → "Owner: share your key"
+  geminiBlob: "",
+
+  // 2) SHARED CLOUD STORAGE (so users share one database, no setup for them)
+  //    From your Firebase project: Web API key + Project ID
+  firebase: {
+    apiKey: "",
+    projectId: ""
+  },
+
+  // 3) ADMIN CODE (lets you see & delete all profiles)
+  //    Generated in: Shared storage → "Set admin code"
+  adminCodeHash: ""
+};
