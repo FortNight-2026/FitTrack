@@ -238,6 +238,7 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
 .sync-bar { display:flex; align-items:center; gap:7px; padding:8px 12px; border-top:1px solid var(--border); font-size:11px; color:var(--muted); cursor:pointer; }
 .sync-bar:hover { background:var(--bg); }
 </style>
+<script src="config.js" onerror="console.log('No config.js — shared key not configured')"></script>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -402,6 +403,47 @@ function getApiKey() {
 }
 function setApiKey(k) {
   localStorage.setItem('gemini_key', k.trim());
+}
+
+/* ── SHARED KEY (encrypt owner's key, unlock with an access code) ── */
+// Any visitor with the access code can use the owner's Gemini key.
+// The encrypted blob lives in config.js (served to everyone); the code is never stored.
+function sharedBlob() {
+  return (window.FITTRACK_SHARED && window.FITTRACK_SHARED.blob) || localStorage.getItem('shared_blob') || '';
+}
+function b64FromBuf(buf) {
+  const bytes = new Uint8Array(buf); let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+function bufFromB64(b64) {
+  const bin = atob(b64); const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+async function deriveAesKey(pass, salt, usage) {
+  const enc = new TextEncoder();
+  const base = await crypto.subtle.importKey('raw', enc.encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    base, { name: 'AES-GCM', length: 256 }, false, usage
+  );
+}
+async function encryptKey(plain, pass) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveAesKey(pass, salt, ['encrypt']);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(plain));
+  const out = new Uint8Array(16 + 12 + ct.byteLength);
+  out.set(salt, 0); out.set(iv, 16); out.set(new Uint8Array(ct), 28);
+  return b64FromBuf(out.buffer);
+}
+async function decryptKey(blob, pass) {
+  const data = bufFromB64(blob);
+  const salt = data.slice(0, 16), iv = data.slice(16, 28), ct = data.slice(28);
+  const key = await deriveAesKey(pass, salt, ['decrypt']);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+  return new TextDecoder().decode(pt);
 }
 
 // Calls Gemini but RETURNS an Anthropic-shaped object {content:[{text}]}
@@ -752,7 +794,7 @@ function selProf(pid) {
   if (!getApiKey()) {
     nav('settings', null);
     document.querySelectorAll('.nb').forEach(b => { if (b.textContent.includes('AI settings')) b.classList.add('on'); });
-    showToast('👋 Add your free Gemini key to enable AI features');
+    showToast(sharedBlob() ? '👋 Enter your access code to enable AI features' : '👋 Add your free Gemini key to enable AI features');
   } else {
     nav('dashboard', document.querySelector('.nb'));
   }
@@ -1442,17 +1484,37 @@ function delProfile() {
 function renderSettings() {
   const key = getApiKey();
   const masked = key ? key.slice(0, 6) + '••••••••••••' + key.slice(-4) : '';
+  const hasShared = !!sharedBlob();
+  const unlockedShared = localStorage.getItem('key_source') === 'shared';
   document.getElementById('page-settings').innerHTML = `
-    <div class="ph"><h2>🔑 AI settings</h2><p>Connect your free Google Gemini key to power nutrition lookup and suggestions</p></div>
+    <div class="ph"><h2>🔑 AI settings</h2><p>Power nutrition lookup & suggestions with Google Gemini (free)</p></div>
 
     <div class="card">
-      <div class="ct" style="margin-bottom:14px"><i class="ti ti-key"></i> Gemini API key</div>
-      <div class="notice ${key ? 'notice-b' : 'notice-a'}" style="margin-bottom:16px">
+      <div class="ct" style="margin-bottom:14px"><i class="ti ti-${key ? 'circle-check' : 'alert-triangle'}"></i> Status</div>
+      <div class="notice ${key ? 'notice-b' : 'notice-a'}" style="margin-bottom:0">
         <i class="ti ti-${key ? 'circle-check' : 'alert-triangle'}" style="font-size:18px"></i>
-        ${key ? 'A key is saved. AI features are active.' : 'No key yet — AI nutrition lookup and suggestions are disabled until you add one.'}
+        ${key
+          ? (unlockedShared ? 'Unlocked with a shared access code. AI features are active.' : 'Your own key is active. AI features are active.')
+          : 'AI is locked. Use a shared access code below, or add your own key.'}
       </div>
+    </div>
+
+    ${hasShared ? `
+    <div class="card">
+      <div class="ct" style="margin-bottom:6px"><i class="ti ti-lock-open"></i> Unlock with access code</div>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">The app owner shared a key. Enter the access code they gave you to turn on AI features — no key of your own needed.</p>
+      <div class="fg"><label>Access code</label><input id="unlock-code" type="password" placeholder="Enter the code you were given"></div>
+      <div class="bgrp">
+        <button class="btn btn-p" onclick="unlockShared()"><i class="ti ti-key"></i> Unlock AI</button>
+        ${unlockedShared ? `<button class="btn btn-d" onclick="clearKey()"><i class="ti ti-lock"></i> Lock again</button>` : ''}
+      </div>
+      <div id="unlock-result" style="margin-top:12px"></div>
+    </div>` : ''}
+
+    <div class="card">
+      <div class="ct" style="margin-bottom:6px"><i class="ti ti-key"></i> ${hasShared ? 'Or use your own key' : 'Your Gemini API key'}</div>
       <div class="fg"><label>Paste your Gemini API key</label>
-        <input id="set-key" type="password" placeholder="${key ? masked : 'AIza...'}" value="">
+        <input id="set-key" type="password" placeholder="${key && !unlockedShared ? masked : 'AIza...'}" value="">
       </div>
       <div class="bgrp" style="margin-top:4px">
         <button class="btn btn-p" onclick="saveKey()"><i class="ti ti-check"></i> Save key</button>
@@ -1460,40 +1522,76 @@ function renderSettings() {
         ${key ? `<button class="btn btn-d" onclick="clearKey()"><i class="ti ti-trash"></i> Remove key</button>` : ''}
       </div>
       <div id="key-test-result" style="margin-top:12px"></div>
+      <div style="font-size:12px;color:var(--muted);margin-top:12px;line-height:1.6">
+        Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" style="color:var(--blue);font-weight:700">aistudio.google.com/apikey</a> — "Create API key", no credit card. 1,500 free requests/day. Stored only in your browser.
+      </div>
     </div>
 
-    <div class="card" style="background:var(--blue-light);border-color:var(--blue)">
-      <div class="ct" style="margin-bottom:12px;color:var(--blue-dark)"><i class="ti ti-help-circle" style="color:var(--blue)"></i> How to get your free key (2 minutes)</div>
-      <ol style="font-size:13px;line-height:2;color:var(--blue-dark);padding-left:20px;margin:0">
-        <li>Go to <a href="https://aistudio.google.com/apikey" target="_blank" style="color:var(--blue);font-weight:700">aistudio.google.com/apikey</a></li>
-        <li>Sign in with any Google account</li>
-        <li>Click <strong>"Create API key"</strong> (no credit card needed)</li>
-        <li>Copy the key and paste it above, then click <strong>Save key</strong></li>
-      </ol>
-      <div style="font-size:12px;color:var(--blue-dark);opacity:.8;margin-top:12px;line-height:1.6">
-        The free tier gives you <strong>1,500 requests per day</strong> — far more than enough for daily tracking. Your key is stored only in this browser and is sent directly to Google, never to any other server.
+    <div class="card" style="border-color:var(--purple)">
+      <div class="ct" style="margin-bottom:6px;color:var(--purple-dark)"><i class="ti ti-users" style="color:var(--purple)"></i> Owner: share your key with an access code</div>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Let other people use <strong>your</strong> Gemini key by giving them an access code, so they don't need their own. <button class="btn btn-o btn-sm" onclick="toggleShareSetup()" id="share-toggle-btn">Set up sharing</button></p>
+      <div id="share-setup" style="display:none">
+        <div class="notice notice-a" style="margin-bottom:14px;align-items:flex-start">
+          <i class="ti ti-alert-triangle" style="font-size:18px;flex-shrink:0"></i>
+          <span style="font-weight:500;line-height:1.5">Only share the access code with people you trust. Anyone with the code can use (and technically extract) your key, and everyone shares your daily free quota.</span>
+        </div>
+        <div class="fg"><label>Your Gemini API key (the one to share)</label><input id="share-key" type="password" placeholder="AIza..."></div>
+        <div class="fg"><label>Choose an access code (share this with your users)</label><input id="share-code" placeholder="e.g. family2026 — make it hard to guess"></div>
+        <button class="btn btn-p" onclick="genSharedConfig()"><i class="ti ti-lock"></i> Generate shared config</button>
+        <div id="share-output" style="margin-top:14px"></div>
       </div>
     </div>`;
+}
+
+function toggleShareSetup() {
+  const el = document.getElementById('share-setup');
+  const show = el.style.display === 'none';
+  el.style.display = show ? 'block' : 'none';
+  document.getElementById('share-toggle-btn').textContent = show ? 'Hide' : 'Set up sharing';
 }
 
 function saveKey() {
   const v = document.getElementById('set-key').value.trim();
   if (!v) { alert('Paste your Gemini API key first.'); return; }
   setApiKey(v);
+  localStorage.setItem('key_source', 'own');
   showToast('✅ API key saved!', 'green');
   renderSettings();
 }
 
 function clearKey() {
-  if (!confirm('Remove the saved API key? AI features will stop working until you add one again.')) return;
+  if (!confirm('Remove the saved key / lock AI? You can unlock or re-add anytime.')) return;
   localStorage.removeItem('gemini_key');
-  showToast('Key removed');
+  localStorage.removeItem('key_source');
+  showToast('AI locked');
   renderSettings();
+}
+
+async function unlockShared() {
+  const code = document.getElementById('unlock-code').value.trim();
+  const el = document.getElementById('unlock-result');
+  if (!code) { el.innerHTML = '<p style="color:var(--red);font-size:13px">Enter the access code.</p>'; return; }
+  el.innerHTML = `<div class="loading"><div class="spin"></div> Unlocking…</div>`;
+  try {
+    const realKey = await decryptKey(sharedBlob(), code);
+    setApiKey(realKey);
+    localStorage.setItem('key_source', 'shared');
+    // verify it actually works
+    const data = await callAI([{ role: 'user', content: 'Reply with exactly: OK' }], 10);
+    if (data.error) throw new Error(data.error.message);
+    el.innerHTML = `<div class="notice notice-b" style="margin:0"><i class="ti ti-circle-check" style="font-size:18px"></i> Unlocked! AI features are now active.</div>`;
+    showToast('✅ AI unlocked!', 'green');
+    setTimeout(renderSettings, 1200);
+  } catch (e) {
+    localStorage.removeItem('gemini_key');
+    localStorage.removeItem('key_source');
+    el.innerHTML = `<div class="notice notice-a" style="margin:0"><i class="ti ti-x" style="font-size:18px"></i> Wrong access code, or the key no longer works.</div>`;
+  }
 }
 
 async function testKey() {
   const typed = document.getElementById('set-key').value.trim();
-  if (typed) setApiKey(typed);
+  if (typed) { setApiKey(typed); localStorage.setItem('key_source', 'own'); }
   const el = document.getElementById('key-test-result');
   if (!getApiKey()) { el.innerHTML = '<p style="color:var(--red);font-size:13px">Add a key first.</p>'; return; }
   el.innerHTML = `<div class="loading"><div class="spin"></div> Testing connection to Gemini…</div>`;
@@ -1504,6 +1602,40 @@ async function testKey() {
     el.innerHTML = `<div class="notice notice-b" style="margin:0"><i class="ti ti-circle-check" style="font-size:18px"></i> Connected! Your key works. AI features are ready.</div>`;
   }
 }
+
+async function genSharedConfig() {
+  const k = document.getElementById('share-key').value.trim();
+  const code = document.getElementById('share-code').value.trim();
+  const out = document.getElementById('share-output');
+  if (!k) { alert('Enter the Gemini key you want to share.'); return; }
+  if (code.length < 4) { alert('Choose an access code of at least 4 characters.'); return; }
+  out.innerHTML = `<div class="loading"><div class="spin"></div> Encrypting…</div>`;
+  try {
+    const blob = await encryptKey(k, code);
+    const line = `window.FITTRACK_SHARED = { blob: "${blob}" };`;
+    // also store locally so it works immediately on this device
+    localStorage.setItem('shared_blob', blob);
+    out.innerHTML = `
+      <div class="notice notice-b" style="margin-bottom:12px"><i class="ti ti-circle-check" style="font-size:18px"></i> Done! Now make it available to your users in 2 steps below.</div>
+      <div style="font-size:13px;font-weight:700;margin-bottom:6px">1. Copy this line:</div>
+      <textarea id="share-blob-text" readonly style="width:100%;min-height:90px;font-family:monospace;font-size:11px;padding:10px;border:2px solid var(--purple);border-radius:8px;background:#fff;color:var(--text);resize:vertical">${line}</textarea>
+      <button class="btn btn-o btn-sm" style="margin:8px 0 14px" onclick="navigator.clipboard.writeText(document.getElementById('share-blob-text').value);showToast('Copied!')"><i class="ti ti-copy"></i> Copy line</button>
+      <div style="font-size:13px;font-weight:700;margin-bottom:6px">2. Put it in <code style="background:var(--bg);padding:2px 6px;border-radius:4px">config.js</code> in your GitHub repo:</div>
+      <ol style="font-size:13px;line-height:1.8;color:var(--text);padding-left:20px;margin:0">
+        <li>Open your repo on GitHub → click <code style="background:var(--bg);padding:1px 5px;border-radius:4px">config.js</code></li>
+        <li>Click the pencil (Edit) icon</li>
+        <li>Replace its contents with the line you copied</li>
+        <li>Click <strong>Commit changes</strong></li>
+      </ol>
+      <div style="font-size:12px;color:var(--muted);margin-top:12px;line-height:1.6">
+        Then share with your users: <strong>your app's URL</strong> + <strong>the access code</strong> (<code style="background:var(--bg);padding:1px 5px;border-radius:4px">${code}</code>). They open the app → AI settings → enter the code → done. It already works on <em>this</em> device.
+      </div>`;
+    showToast('✅ Shared config generated', 'green');
+  } catch (e) {
+    out.innerHTML = `<p style="color:var(--red);font-size:13px">Encryption failed: ${e.message}</p>`;
+  }
+}
+
 
 /* ══════════ CLOUD SYNC PAGE ══════════ */
 function renderCloud() {
