@@ -251,7 +251,9 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
       <div class="brand-name">FitTrack</div>
     </div>
     <div class="brand-tagline">Your personal health & fitness companion</div>
+    <div id="picker-status" style="font-size:11px;color:var(--muted);margin-bottom:10px;display:none"></div>
     <div class="pgrid" id="pgrid"></div>
+    <div id="admin-area" style="margin-top:12px;display:none"></div>
   </div>
 </div>
 
@@ -322,6 +324,15 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
         <button class="chip" onclick="this.classList.toggle('on-red')">Soy</button>
         <button class="chip" onclick="this.classList.toggle('on-red')">Peanuts</button>
         <button class="chip" onclick="this.classList.toggle('on-red')">Fish</button>
+      </div>
+    </div>
+
+    <div class="fsec" id="pin-section" style="display:none">
+      <div class="fsec-title"><i class="ti ti-lock"></i> Profile unlock code</div>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Set a private code to lock this profile. You'll enter it each time you open the profile, and it keeps your data private from other users. <strong>Important: it can't be recovered if forgotten.</strong></p>
+      <div class="fg2">
+        <div class="fg"><label>Unlock code (PIN)</label><input id="np-pin" type="password" placeholder="Choose a code"></div>
+        <div class="fg"><label>Confirm code</label><input id="np-pin2" type="password" placeholder="Re-enter code"></div>
       </div>
     </div>
 
@@ -408,9 +419,16 @@ function setApiKey(k) {
 /* ── SHARED KEY (encrypt owner's key, unlock with an access code) ── */
 // Any visitor with the access code can use the owner's Gemini key.
 // The encrypted blob lives in config.js (served to everyone); the code is never stored.
+function cfg() { return window.FITTRACK_CONFIG || {}; }
 function sharedBlob() {
-  return (window.FITTRACK_SHARED && window.FITTRACK_SHARED.blob) || localStorage.getItem('shared_blob') || '';
+  return cfg().geminiBlob || (window.FITTRACK_SHARED && window.FITTRACK_SHARED.blob) || localStorage.getItem('shared_blob') || '';
 }
+function fbConfig() {
+  const f = cfg().firebase || {};
+  return (f.apiKey && f.projectId) ? f : null;
+}
+function adminHash() { return cfg().adminCodeHash || ''; }
+function sharedMode() { return !!fbConfig(); }
 function b64FromBuf(buf) {
   const bytes = new Uint8Array(buf); let s = '';
   for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
@@ -445,6 +463,104 @@ async function decryptKey(blob, pass) {
   const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
   return new TextDecoder().decode(pt);
 }
+
+async function sha256hex(s) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/* ══════════ FIREBASE (Firestore REST) — shared cloud storage ══════════ */
+// Profiles are stored in the OWNER's Firebase. Each profile's data is
+// encrypted with that profile's PIN, so users only access their own.
+let fbToken = null, fbTokenExp = 0;
+
+async function fbAuth() {
+  if (fbToken && Date.now() < fbTokenExp - 60000) return fbToken;
+  const f = fbConfig();
+  if (!f) throw new Error('Shared storage not configured.');
+  const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${f.apiKey}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ returnSecureToken: true }),
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message || 'Auth failed');
+  fbToken = d.idToken;
+  fbTokenExp = Date.now() + (parseInt(d.expiresIn || '3600') * 1000);
+  return fbToken;
+}
+
+function fbBase() {
+  const f = fbConfig();
+  return `https://firestore.googleapis.com/v1/projects/${f.projectId}/databases/(default)/documents`;
+}
+
+// Encode a plain JS object into Firestore typed "fields"
+function fbEncode(obj) {
+  const fields = {};
+  for (const k in obj) {
+    const v = obj[k];
+    if (typeof v === 'string') fields[k] = { stringValue: v };
+    else if (typeof v === 'boolean') fields[k] = { booleanValue: v };
+    else if (typeof v === 'number') fields[k] = Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+    else if (v == null) fields[k] = { nullValue: null };
+    else fields[k] = { stringValue: JSON.stringify(v) };
+  }
+  return fields;
+}
+function fbDecode(fields) {
+  const out = {};
+  for (const k in (fields || {})) {
+    const v = fields[k];
+    if ('stringValue' in v) out[k] = v.stringValue;
+    else if ('booleanValue' in v) out[k] = v.booleanValue;
+    else if ('integerValue' in v) out[k] = parseInt(v.integerValue);
+    else if ('doubleValue' in v) out[k] = v.doubleValue;
+    else if ('nullValue' in v) out[k] = null;
+  }
+  return out;
+}
+
+async function fbListProfiles() {
+  const token = await fbAuth();
+  const r = await fetch(`${fbBase()}/profiles?pageSize=300`, { headers: { Authorization: 'Bearer ' + token } });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message);
+  return (d.documents || []).map(doc => {
+    const id = doc.name.split('/').pop();
+    return { id, ...fbDecode(doc.fields) };
+  });
+}
+
+async function fbGetProfile(id) {
+  const token = await fbAuth();
+  const r = await fetch(`${fbBase()}/profiles/${id}`, { headers: { Authorization: 'Bearer ' + token } });
+  if (r.status === 404) return null;
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message);
+  return { id, ...fbDecode(d.fields) };
+}
+
+async function fbSetProfile(id, obj) {
+  const token = await fbAuth();
+  const r = await fetch(`${fbBase()}/profiles/${id}`, {
+    method: 'PATCH',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields: fbEncode(obj) }),
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message);
+  return d;
+}
+
+async function fbDeleteProfile(id) {
+  const token = await fbAuth();
+  const r = await fetch(`${fbBase()}/profiles/${id}`, {
+    method: 'DELETE', headers: { Authorization: 'Bearer ' + token },
+  });
+  if (!r.ok && r.status !== 404) { const d = await r.json().catch(() => ({})); throw new Error(d.error?.message || 'Delete failed'); }
+  return true;
+}
+
 
 // Calls Gemini but RETURNS an Anthropic-shaped object {content:[{text}]}
 // so the rest of the app code doesn't need to change.
@@ -695,15 +811,48 @@ function fmtS(d) {
   return new Date(d + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
+// In-memory working state. In shared mode, S.profiles is the roster (id+name+locked)
+// and only the CURRENT unlocked profile has full fields + decrypted data.
+let currentPin = null; // PIN of the currently open profile (kept in memory only)
+
 function save() {
   S.updatedAt = Date.now();
   try { localStorage.setItem('ft4', JSON.stringify(S)); } catch (e) {}
   try { if (window.storage) window.storage.set('ft4', JSON.stringify(S)); } catch (e) {}
-  scheduleDriveSync();
+  if (sharedMode()) schedulePush();      // push current profile to Firestore
+  else scheduleDriveSync();              // legacy local/Drive mode
 }
 async function load() {
   try { const s = localStorage.getItem('ft4'); if (s) S = JSON.parse(s); } catch (e) {}
   try { if (window.storage) { const r = await window.storage.get('ft4'); if (r?.value) S = JSON.parse(r.value); } } catch (e) {}
+}
+
+/* Build the encrypted Firestore payload for the current profile */
+async function buildProfileDoc(p) {
+  const payload = JSON.stringify({ profile: p, data: S.data[p.id] || { days: {} } });
+  const doc = { name: p.name, locked: !!p.pin, updatedAt: Date.now(), createdAt: p.createdAt || Date.now() };
+  if (p.pin) doc.enc = await encryptKey(payload, p.pin);
+  else doc.data = payload; // not locked → stored as plain JSON string
+  return doc;
+}
+
+let pushTimer = null;
+function schedulePush() {
+  if (!sharedMode() || !S.current) return;
+  const p = prof(); if (!p || !p.id) return;
+  clearTimeout(pushTimer);
+  setSyncStatus('busy', 'Saving…');
+  pushTimer = setTimeout(async () => {
+    try {
+      const doc = await buildProfileDoc(p);
+      await fbSetProfile(p.id, doc);
+      const now = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+      localStorage.setItem('gdrive_last_sync', now);
+      setSyncStatus('on', 'Saved ' + now);
+    } catch (e) {
+      setSyncStatus('off', 'Save error');
+    }
+  }, 1500);
 }
 
 function dayOf(pid, dt) {
@@ -744,25 +893,129 @@ function goScr(name) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById('scr-' + name).classList.add('active');
   if (name === 'profiles') renderProfiles();
+  if (name === 'new') {
+    // show PIN section only in shared mode (where isolation matters)
+    document.getElementById('pin-section').style.display = sharedMode() ? 'block' : 'none';
+  }
 }
 
-/* ── PROFILES ── */
-function renderProfiles() {
+let adminMode = false;
+let roster = []; // shared-mode roster from Firestore
+
+/* ── PROFILES PICKER ── */
+async function renderProfiles() {
   const g = document.getElementById('pgrid');
+  const statusEl = document.getElementById('picker-status');
+  const adminEl = document.getElementById('admin-area');
+
+  if (sharedMode()) {
+    statusEl.style.display = 'block';
+    statusEl.innerHTML = '<span class="spin" style="width:11px;height:11px;display:inline-block;vertical-align:middle"></span> Loading profiles from shared storage…';
+    g.innerHTML = '';
+    try {
+      roster = await fbListProfiles();
+      roster.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+      statusEl.innerHTML = `☁️ Shared storage · ${roster.length} profile${roster.length === 1 ? '' : 's'}`;
+      g.innerHTML = roster.map((p, i) =>
+        `<div class="ptile" onclick="pickProfile('${p.id}')">
+           <div class="pav" style="background:${colFor(i)}">${inits(p.name)}</div>
+           <div class="pn">${p.name} ${p.locked ? '<i class="ti ti-lock" style="font-size:11px;color:var(--muted)"></i>' : ''}</div>
+           <div class="pg">${adminMode ? '<span style="color:var(--red)">tap to delete</span>' : (p.locked ? 'Locked' : 'Open')}</div>
+         </div>`
+      ).join('') +
+      (adminMode ? '' : `<div class="ptile add-ptile" onclick="goScr('new')"><i class="ti ti-plus"></i><span>Add profile</span></div>`);
+    } catch (e) {
+      statusEl.innerHTML = `<span style="color:var(--red)">Couldn't load shared storage: ${e.message}</span>`;
+      g.innerHTML = `<div class="ptile add-ptile" onclick="goScr('new')"><i class="ti ti-plus"></i><span>Add profile</span></div>`;
+    }
+    // admin controls
+    if (adminHash()) {
+      adminEl.style.display = 'block';
+      adminEl.innerHTML = adminMode
+        ? `<div style="text-align:center"><span class="bg bg-r" style="margin-bottom:8px;display:inline-block">⚙️ Admin mode — tap a profile to delete it</span><br><button class="btn btn-o btn-sm" style="margin-top:8px" onclick="exitAdmin()">Exit admin</button></div>`
+        : `<div style="text-align:center"><button class="btn btn-o btn-sm" onclick="promptAdmin()"><i class="ti ti-shield-lock"></i> Admin login</button></div>`;
+    } else {
+      adminEl.style.display = 'none';
+    }
+    return;
+  }
+
+  // ── LOCAL MODE (no Firebase) — original behaviour ──
+  statusEl.style.display = 'none';
+  adminEl.style.display = 'none';
   g.innerHTML = S.profiles.map((p, i) =>
-    `<div class="ptile" onclick="selProf('${p.id}')">
+    `<div class="ptile" onclick="pickProfile('${p.id}')">
        <div class="pav" style="background:${colFor(i)}">${inits(p.name)}</div>
-       <div class="pn">${p.name}</div><div class="pg">${p.goal || ''}</div>
+       <div class="pn">${p.name} ${p.pin ? '<i class="ti ti-lock" style="font-size:11px;color:var(--muted)"></i>' : ''}</div><div class="pg">${p.goal || ''}</div>
      </div>`
   ).join('') +
-  `<div class="ptile add-ptile" onclick="goScr('new')">
-     <i class="ti ti-plus"></i><span>Add profile</span>
-   </div>`;
+  `<div class="ptile add-ptile" onclick="goScr('new')"><i class="ti ti-plus"></i><span>Add profile</span></div>`;
+}
+
+/* Tap a profile: admin→delete, else unlock if needed, else open */
+async function pickProfile(pid) {
+  if (adminMode) { adminDelete(pid); return; }
+  if (sharedMode()) {
+    const meta = roster.find(p => p.id === pid);
+    if (meta && meta.locked) { promptPin(pid, meta.name); return; }
+    await openSharedProfile(pid, null); // not locked
+    return;
+  }
+  // local mode
+  const p = S.profiles.find(x => x.id === pid);
+  if (p && p.pin) { promptPinLocal(pid); return; }
+  selProf(pid);
+}
+
+/* Load + decrypt a shared profile into working state, then open it */
+async function openSharedProfile(pid, pin) {
+  try {
+    showToast('Opening…');
+    const doc = await fbGetProfile(pid);
+    if (!doc) { alert('Profile not found.'); return; }
+    let payload;
+    if (doc.locked) {
+      if (!pin) { promptPin(pid, doc.name); return; }
+      payload = JSON.parse(await decryptKey(doc.enc, pin));
+    } else {
+      payload = JSON.parse(doc.data);
+    }
+    const p = payload.profile;
+    p.pin = pin || null;
+    // load into working memory
+    const idx = S.profiles.findIndex(x => x.id === pid);
+    if (idx >= 0) S.profiles[idx] = p; else S.profiles.push(p);
+    S.data[pid] = payload.data || { days: {} };
+    currentPin = pin || null;
+    openProfileUI(pid);
+  } catch (e) {
+    alert('Could not open profile: ' + (e.message || e));
+  }
+}
+
+function promptPin(pid, name) {
+  const code = prompt(`Enter the unlock code for "${name}":`);
+  if (code == null) return;
+  openSharedProfile(pid, code).catch(() => alert('Wrong code.'));
+}
+function promptPinLocal(pid) {
+  const p = S.profiles.find(x => x.id === pid);
+  const code = prompt(`Enter the unlock code for "${p.name}":`);
+  if (code == null) return;
+  if (code === p.pin) selProf(pid);
+  else alert('Wrong code.');
 }
 
 function createProfile() {
   const name = document.getElementById('np-name').value.trim();
   if (!name) { alert('Please enter your name.'); return; }
+  let pin = null;
+  if (sharedMode()) {
+    pin = document.getElementById('np-pin').value;
+    const pin2 = document.getElementById('np-pin2').value;
+    if (!pin) { alert('Please set an unlock code to keep your profile private.'); return; }
+    if (pin !== pin2) { alert('The two unlock codes do not match.'); return; }
+  }
   const age = parseInt(document.getElementById('np-age').value) || 25;
   const height = parseFloat(document.getElementById('np-ht').value) || 170;
   const weight = parseFloat(document.getElementById('np-wt').value) || 70;
@@ -776,17 +1029,39 @@ function createProfile() {
   let calTarget = tdee;
   if (goalSel === 'Lose weight') calTarget = Math.round(tdee - 500);
   else if (goalSel === 'Build muscle') calTarget = Math.round(tdee + 300);
-  const id = 'p' + Date.now();
-  const p = { id, name, age, height, weight, sex, act, goal: goalSel, diet: dietSel, allergies, calTarget, tdee };
+  const id = 'p' + Date.now() + Math.floor(Math.random() * 1000);
+  const p = { id, name, age, height, weight, sex, act, goal: goalSel, diet: dietSel, allergies, calTarget, tdee, createdAt: Date.now(), pin };
+  S.profiles = S.profiles.filter(x => x.id !== id);
   S.profiles.push(p);
   S.data[id] = { days: {} };
   dayOf(id, tday()).weight = weight;
-  save(); selProf(id);
+  currentPin = pin;
+  // clear PIN fields
+  if (document.getElementById('np-pin')) { document.getElementById('np-pin').value = ''; document.getElementById('np-pin2').value = ''; }
+  if (sharedMode()) {
+    // push to Firestore immediately, then open
+    (async () => {
+      try { await fbSetProfile(id, await buildProfileDoc(p)); } catch (e) { alert('Could not save to shared storage: ' + e.message); }
+      openProfileUI(id);
+    })();
+  } else {
+    save(); openProfileUI(id);
+  }
 }
 
+/* selProf kept for local mode */
 function selProf(pid) {
-  S.current = pid; save(); viewDate = tday();
-  const p = prof(), i = S.profiles.findIndex(x => x.id === pid);
+  const p = S.profiles.find(x => x.id === pid);
+  currentPin = p ? p.pin : null;
+  openProfileUI(pid);
+}
+
+/* Shared UI opener (used by both modes once data is in memory) */
+function openProfileUI(pid) {
+  S.current = pid;
+  if (!sharedMode()) save();
+  viewDate = tday();
+  const p = prof(), i = Math.max(0, S.profiles.findIndex(x => x.id === pid));
   const av = document.getElementById('sb-av');
   av.textContent = inits(p.name); av.style.background = colFor(i);
   document.getElementById('sb-name').textContent = p.name;
@@ -798,6 +1073,25 @@ function selProf(pid) {
   } else {
     nav('dashboard', document.querySelector('.nb'));
   }
+}
+
+/* ── ADMIN ── */
+async function promptAdmin() {
+  const code = prompt('Enter the admin code:');
+  if (code == null) return;
+  const h = await sha256hex(code);
+  if (h === adminHash()) { adminMode = true; renderProfiles(); showToast('⚙️ Admin mode on'); }
+  else alert('Wrong admin code.');
+}
+function exitAdmin() { adminMode = false; renderProfiles(); }
+async function adminDelete(pid) {
+  const meta = roster.find(p => p.id === pid);
+  if (!confirm(`ADMIN: permanently delete profile "${meta ? meta.name : pid}" and all its data? This cannot be undone.`)) return;
+  try {
+    await fbDeleteProfile(pid);
+    showToast('Profile deleted');
+    renderProfiles();
+  } catch (e) { alert('Delete failed: ' + e.message); }
 }
 
 /* ── NAV ── */
@@ -1476,8 +1770,14 @@ function saveProfile() {
 
 function delProfile() {
   if (!confirm('Delete this profile and ALL data permanently?')) return;
-  S.profiles = S.profiles.filter(x => x.id !== S.current);
-  delete S.data[S.current]; S.current = null; save(); goScr('profiles');
+  const id = S.current;
+  if (sharedMode()) {
+    fbDeleteProfile(id).catch(e => alert('Cloud delete failed: ' + e.message));
+  }
+  S.profiles = S.profiles.filter(x => x.id !== id);
+  delete S.data[id]; S.current = null; currentPin = null;
+  if (!sharedMode()) save();
+  goScr('profiles');
 }
 
 /* ══════════ AI SETTINGS ══════════ */
@@ -1638,7 +1938,59 @@ async function genSharedConfig() {
 
 
 /* ══════════ CLOUD SYNC PAGE ══════════ */
+/* ══════════ SHARED STORAGE PAGE (Firebase mode) ══════════ */
+function renderSharedStorage() {
+  const f = fbConfig();
+  document.getElementById('page-cloud').innerHTML = `
+    <div class="ph"><h2>☁️ Shared storage</h2><p>Everyone's profiles are saved in the owner's shared cloud database</p></div>
+
+    <div class="card">
+      <div class="ct" style="margin-bottom:12px"><i class="ti ti-cloud-check"></i> Status</div>
+      <div class="notice notice-b" style="margin:0">
+        <i class="ti ti-circle-check" style="font-size:18px"></i>
+        Connected to shared storage (project: <strong>${f.projectId}</strong>). Your profile auto-saves and syncs across devices.
+      </div>
+    </div>
+
+    <div class="card" style="background:var(--blue-light);border-color:var(--blue)">
+      <div class="ct" style="margin-bottom:8px;color:var(--blue-dark)"><i class="ti ti-info-circle" style="color:var(--blue)"></i> How it works</div>
+      <div style="font-size:13px;line-height:1.7;color:var(--blue-dark)">
+        Each profile is locked with its own unlock code and encrypted, so only you can open yours. Pick your profile on the start screen and enter your code to access your data. It stays in sync on any device that opens this app.
+      </div>
+    </div>
+
+    <div class="card" style="border-color:var(--purple)">
+      <div class="ct" style="margin-bottom:8px;color:var(--purple-dark)"><i class="ti ti-shield-cog" style="color:var(--purple)"></i> Owner / admin tools</div>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Set an admin code to let yourself manage all profiles from the start screen. <button class="btn btn-o btn-sm" id="admin-gen-toggle" onclick="toggleAdminGen()">Set admin code</button></p>
+      <div id="admin-gen" style="display:none">
+        <div class="fg"><label>Choose an admin code</label><input id="admin-code-in" placeholder="A strong code only you know"></div>
+        <button class="btn btn-p" onclick="genAdminConfig()"><i class="ti ti-lock"></i> Generate admin config line</button>
+        <div id="admin-gen-out" style="margin-top:12px"></div>
+      </div>
+    </div>`;
+}
+
+function toggleAdminGen() {
+  const el = document.getElementById('admin-gen');
+  const show = el.style.display === 'none';
+  el.style.display = show ? 'block' : 'none';
+  document.getElementById('admin-gen-toggle').textContent = show ? 'Hide' : 'Set admin code';
+}
+async function genAdminConfig() {
+  const code = document.getElementById('admin-code-in').value.trim();
+  const out = document.getElementById('admin-gen-out');
+  if (code.length < 4) { alert('Choose an admin code of at least 4 characters.'); return; }
+  const h = await sha256hex(code);
+  out.innerHTML = `
+    <div class="notice notice-b" style="margin-bottom:10px"><i class="ti ti-circle-check" style="font-size:18px"></i> Done. Put this in config.js (inside FITTRACK_CONFIG), then commit.</div>
+    <div style="font-size:13px;font-weight:700;margin-bottom:6px">Set <code style="background:var(--bg);padding:1px 5px;border-radius:4px">adminCodeHash</code> to:</div>
+    <textarea readonly id="admin-hash-text" style="width:100%;min-height:60px;font-family:monospace;font-size:11px;padding:10px;border:2px solid var(--purple);border-radius:8px;background:#fff;resize:vertical">"${h}"</textarea>
+    <button class="btn btn-o btn-sm" style="margin-top:8px" onclick="navigator.clipboard.writeText(document.getElementById('admin-hash-text').value);showToast('Copied!')"><i class="ti ti-copy"></i> Copy</button>
+    <div style="font-size:12px;color:var(--muted);margin-top:10px">After committing, open the start screen → "Admin login" → enter your code to see and delete any profile. The code itself is never stored — only this hash.</div>`;
+}
+
 function renderCloud() {
+  if (sharedMode()) { renderSharedStorage(); return; }
   const cid = getClientId();
   const enabled = driveEnabled();
   const origin = window.location.origin;
@@ -1687,6 +2039,13 @@ function renderCloud() {
       <div style="font-size:12px;color:var(--blue-dark);opacity:.8;margin-top:12px;line-height:1.6">
         Your data is stored in a private folder only this app can access. To sync a second device, host the same app, enter the same Client ID, and connect — your history merges automatically.
       </div>
+    </div>
+
+    <div class="card" style="border-color:var(--purple)">
+      <div class="ct" style="margin-bottom:8px;color:var(--purple-dark)"><i class="ti ti-users" style="color:var(--purple)"></i> Want multiple people to share one storage?</div>
+      <div style="font-size:13px;line-height:1.7;color:var(--text)">
+        The Google Drive sync above is for <strong>your own</strong> devices. To let several people each have their own PIN-locked profile in one shared database (with admin controls), set up <strong>Firebase shared storage</strong> — see the <strong>"Shared storage (multi-user)"</strong> section in the README. Once you add the Firebase details to <code style="background:var(--bg);padding:1px 5px;border-radius:4px">config.js</code>, this page switches to shared-storage mode automatically.
+      </div>
     </div>`;
 }
 
@@ -1727,10 +2086,18 @@ function cloudDisconnect() {
 /* ── INIT ── */
 async function init() {
   await load();
-  // Restore sync indicator state
+  if (sharedMode()) {
+    // Shared mode: always start at the picker (loaded fresh from Firestore).
+    // Don't auto-open a cached profile — users must pick + unlock each session.
+    setSyncStatus('on', 'Shared storage');
+    S.current = null;
+    renderProfiles();
+    goScr('profiles');
+    return;
+  }
+  // Local / Drive mode
   if (driveEnabled() && getClientId()) {
     setSyncStatus('on', lastSync() ? 'Synced ' + lastSync() : 'Sync ready');
-    // Auto-sync on load (pull latest from other devices), after GIS loads
     setTimeout(() => driveSyncNow(false), 1500);
   } else {
     setSyncStatus('off', 'Not synced');
