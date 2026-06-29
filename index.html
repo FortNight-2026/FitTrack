@@ -406,10 +406,11 @@ function setApiKey(k) {
 
 // Calls Gemini but RETURNS an Anthropic-shaped object {content:[{text}]}
 // so the rest of the app code doesn't need to change.
-async function callAI(messages, max_tokens = 800) {
+// jsonMode=true forces Gemini to return clean JSON (used for food/exercise lookup).
+async function callAI(messages, max_tokens = 800, jsonMode = false) {
   const key = getApiKey();
   if (!key) {
-    return { error: { message: 'No Gemini API key set. Open Settings (gear icon) to add your free key.' } };
+    return { error: { message: 'No Gemini API key set. Open AI settings to add your free key.' } };
   }
   // Convert our simple {role, content} messages into Gemini's format.
   const contents = messages.map(m => ({
@@ -417,27 +418,53 @@ async function callAI(messages, max_tokens = 800) {
     parts: [{ text: m.content }],
   }));
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`;
+  const generationConfig = {
+    maxOutputTokens: max_tokens,
+    temperature: jsonMode ? 0.2 : 0.7,
+    // Gemini 2.5 Flash "thinks" by default and spends output tokens on it,
+    // which truncates short replies. Disable thinking so all tokens go to the answer.
+    thinkingConfig: { thinkingBudget: 0 },
+  };
+  if (jsonMode) generationConfig.responseMimeType = 'application/json';
   try {
     const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents,
-        generationConfig: { maxOutputTokens: max_tokens, temperature: 0.7 },
-      }),
+      body: JSON.stringify({ contents, generationConfig }),
     });
     const data = await r.json();
     if (data.error) {
       return { error: { message: data.error.message || 'Gemini API error' } };
     }
-    const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+    const cand = data?.candidates?.[0];
+    const text = cand?.content?.parts?.map(p => p.text).join('') || '';
     if (!text) {
-      return { error: { message: 'Gemini returned an empty response. Try again.' } };
+      // If it stopped for safety or ran out of tokens with nothing usable
+      const why = cand?.finishReason ? ' (' + cand.finishReason + ')' : '';
+      return { error: { message: 'Gemini returned an empty response' + why + '. Try again.' } };
     }
-    return { content: [{ text }] };
+    return { content: [{ text }], finishReason: cand?.finishReason };
   } catch (e) {
     return { error: { message: e.message || 'Network error calling Gemini.' } };
   }
+}
+
+// Robust JSON extractor — tolerates extra text or minor truncation.
+function parseJSONLoose(txt) {
+  if (!txt) throw new Error('empty');
+  let s = txt.replace(/```json|```/g, '').trim();
+  const start = s.indexOf('{');
+  if (start === -1) throw new Error('no object found');
+  s = s.slice(start);
+  // Try direct parse first
+  try { return JSON.parse(s); } catch (e) {}
+  // Try trimming to the last closing brace
+  const end = s.lastIndexOf('}');
+  if (end !== -1) {
+    try { return JSON.parse(s.slice(0, end + 1)); } catch (e) {}
+  }
+  // Last resort: pull out the numeric/string fields we expect
+  throw new Error('could not parse response');
 }
 
 /* ══════════ GOOGLE DRIVE SYNC ══════════ */
@@ -957,13 +984,9 @@ Return ONLY a valid JSON object, no markdown fences, no explanation before or af
 All numbers must be integers. Be accurate.`;
 
   try {
-    const data = await callAI([{ role: 'user', content: prompt }], 200);
+    const data = await callAI([{ role: 'user', content: prompt }], 1024, true);
     if (data.error) throw new Error(data.error.message || data.error);
-    let txt = (data.content?.[0]?.text || '{}').replace(/```json|```/g, '').trim();
-    // extract JSON if there's extra text
-    const m = txt.match(/\{[\s\S]*\}/);
-    if (m) txt = m[0];
-    const f = JSON.parse(txt);
+    const f = parseJSONLoose(data.content?.[0]?.text || '');
     el.innerHTML = `
       <div class="rbox">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
@@ -1103,11 +1126,9 @@ Return ONLY valid JSON, no markdown:
 {"calBurned":integer,"met":number,"tip":"one practical tip about this exercise in under 20 words"}`;
 
   try {
-    const data = await callAI([{ role: 'user', content: prompt }], 150);
+    const data = await callAI([{ role: 'user', content: prompt }], 1024, true);
     if (data.error) throw new Error(data.error.message || data.error);
-    let txt = (data.content?.[0]?.text || '{}').replace(/```json|```/g, '').trim();
-    const m = txt.match(/\{[\s\S]*\}/); if (m) txt = m[0];
-    const ex = JSON.parse(txt);
+    const ex = parseJSONLoose(data.content?.[0]?.text || '');
     el.innerHTML = `
       <div class="rbox">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
@@ -1285,7 +1306,7 @@ Respect diet (${p.diet}) and allergies. Be friendly, specific, and motivating. U
   };
 
   try {
-    const data = await callAI([{ role:'user', content: prompts[type] }], 900);
+    const data = await callAI([{ role:'user', content: prompts[type] }], 1500);
     if (data.error) throw new Error(data.error.message || data.error);
     const text = data.content?.[0]?.text || 'Could not get suggestions.';
     el.innerHTML = `<div class="card"><div class="ai-out">${text}</div><div class="bgrp" style="margin-top:12px"><button class="btn btn-o btn-sm" onclick="getSug('${type}',null)"><i class="ti ti-refresh"></i> Refresh</button></div></div>`;
