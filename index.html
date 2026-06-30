@@ -238,8 +238,7 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
 .sync-bar { display:flex; align-items:center; gap:7px; padding:8px 12px; border-top:1px solid var(--border); font-size:11px; color:var(--muted); cursor:pointer; }
 .sync-bar:hover { background:var(--bg); }
 </style>
-<script src="config.js" onerror="console.log('No config.js — shared key not configured')"></script>
-<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="config.js" onerror="console.log('No config.js — shared features off')"></script>
 </head>
 <body>
 
@@ -367,7 +366,7 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
       <div class="nav-lbl">Account</div>
       <button class="nb" onclick="nav('profile',this)"><i class="ti ti-user-cog"></i><span>My profile</span></button>
       <button class="nb" onclick="nav('settings',this)"><i class="ti ti-key"></i><span>AI settings</span></button>
-      <button class="nb" onclick="nav('cloud',this)"><i class="ti ti-cloud"></i><span>Cloud sync</span></button>
+      <button class="nb" onclick="nav('cloud',this)"><i class="ti ti-cloud"></i><span>Shared storage</span></button>
     </div>
 
     <div class="sync-bar" onclick="nav('cloud',null)" title="Cloud sync status">
@@ -820,7 +819,6 @@ function save() {
   try { localStorage.setItem('ft4', JSON.stringify(S)); } catch (e) {}
   try { if (window.storage) window.storage.set('ft4', JSON.stringify(S)); } catch (e) {}
   if (sharedMode()) schedulePush();      // push current profile to Firestore
-  else scheduleDriveSync();              // legacy local/Drive mode
 }
 async function load() {
   try { const s = localStorage.getItem('ft4'); if (s) S = JSON.parse(s); } catch (e) {}
@@ -1098,7 +1096,11 @@ async function adminDelete(pid) {
 function nav(page, btn) {
   document.querySelectorAll('.nb').forEach(b => b.classList.remove('on'));
   if (btn) btn.classList.add('on');
-  else document.querySelectorAll('.nb').forEach(b => { if (b.textContent.toLowerCase().includes(page)) b.classList.add('on'); });
+  else {
+    const alias = { cloud: 'shared storage', settings: 'ai settings', profile: 'my profile' };
+    const needle = alias[page] || page;
+    document.querySelectorAll('.nb').forEach(b => { if (b.textContent.toLowerCase().includes(needle)) b.classList.add('on'); });
+  }
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.getElementById('page-' + page).classList.add('active');
   activePage = page;
@@ -1991,96 +1993,36 @@ async function genAdminConfig() {
 
 function renderCloud() {
   if (sharedMode()) { renderSharedStorage(); return; }
-  const cid = getClientId();
-  const enabled = driveEnabled();
-  const origin = window.location.origin;
+  // No Firebase configured yet → this is the OWNER, before setup.
+  // Users never see an OAuth prompt; they only ever see the shared-storage app.
   document.getElementById('page-cloud').innerHTML = `
-    <div class="ph"><h2>☁️ Cloud sync</h2><p>Sync your history across all your devices with Google Drive</p></div>
+    <div class="ph"><h2>☁️ Shared storage</h2><p>Set up one shared database so several people can use this app</p></div>
 
-    <div class="card">
-      <div class="ct" style="margin-bottom:14px"><i class="ti ti-cloud-cog"></i> Status</div>
-      <div class="notice ${enabled ? 'notice-b' : 'notice-a'}" style="margin-bottom:14px">
-        <i class="ti ti-${enabled ? 'cloud-check' : 'cloud-off'}" style="font-size:18px"></i>
-        ${enabled ? `Cloud sync is ON. ${lastSync() ? 'Last synced: ' + lastSync() : 'Not synced yet — click Sync now.'}` : 'Cloud sync is off. Your data is only on this device.'}
-      </div>
-      ${enabled ? `
-        <div class="bgrp">
-          <button class="btn btn-p" onclick="cloudSyncBtn()"><i class="ti ti-refresh"></i> Sync now</button>
-          <button class="btn btn-d" onclick="cloudDisconnect()"><i class="ti ti-cloud-off"></i> Turn off sync</button>
-        </div>
-      ` : cid ? `
-        <button class="btn btn-p" onclick="cloudConnect()"><i class="ti ti-brand-google"></i> Connect Google Drive</button>
-      ` : `<p style="font-size:13px;color:var(--muted)">Add your OAuth Client ID below first.</p>`}
-    </div>
-
-    <div class="card">
-      <div class="ct" style="margin-bottom:14px"><i class="ti ti-id"></i> Google OAuth Client ID</div>
-      <div class="fg"><label>Client ID (ends with .apps.googleusercontent.com)</label>
-        <input id="cloud-cid" placeholder="${cid || '1234...apps.googleusercontent.com'}" value="${cid}">
-      </div>
-      <button class="btn btn-o" onclick="cloudSaveCid()"><i class="ti ti-check"></i> Save Client ID</button>
+    <div class="notice notice-a" style="margin-bottom:16px">
+      <i class="ti ti-info-circle" style="font-size:18px"></i>
+      Shared storage isn't set up yet. Right now data is saved only on this device.
     </div>
 
     <div class="card" style="background:var(--blue-light);border-color:var(--blue)">
-      <div class="ct" style="margin-bottom:12px;color:var(--blue-dark)"><i class="ti ti-help-circle" style="color:var(--blue)"></i> One-time setup (5 minutes)</div>
-      <ol style="font-size:13px;line-height:1.9;color:var(--blue-dark);padding-left:20px;margin:0">
-        <li>Go to <a href="https://console.cloud.google.com/projectcreate" target="_blank" style="color:var(--blue);font-weight:700">console.cloud.google.com</a> and create a project (free)</li>
-        <li>In the search bar, find <strong>"Google Drive API"</strong> and click <strong>Enable</strong></li>
-        <li>Go to <strong>APIs &amp; Services → OAuth consent screen</strong>. Choose <strong>External</strong>, fill in an app name and your email, and add yourself as a <strong>Test user</strong></li>
-        <li>Go to <strong>APIs &amp; Services → Credentials → Create credentials → OAuth client ID</strong></li>
-        <li>Application type: <strong>Web application</strong></li>
-        <li>Under <strong>Authorized JavaScript origins</strong>, add this exact URL:<br>
-          <code style="background:#fff;border:1px solid var(--blue);border-radius:4px;padding:3px 8px;display:inline-block;margin-top:4px;font-size:12px;color:var(--blue-dark)">${origin}</code>
-          <button class="btn btn-o btn-sm" style="margin-left:6px" onclick="navigator.clipboard.writeText('${origin}');showToast('Copied!')"><i class="ti ti-copy"></i></button>
-        </li>
-        <li>Click <strong>Create</strong>, copy the <strong>Client ID</strong>, paste it in the box above, and click <strong>Save</strong></li>
-        <li>Then click <strong>Connect Google Drive</strong> and approve access</li>
-      </ol>
-      <div style="font-size:12px;color:var(--blue-dark);opacity:.8;margin-top:12px;line-height:1.6">
-        Your data is stored in a private folder only this app can access. To sync a second device, host the same app, enter the same Client ID, and connect — your history merges automatically.
+      <div class="ct" style="margin-bottom:12px;color:var(--blue-dark)"><i class="ti ti-cloud-cog" style="color:var(--blue)"></i> Turn on shared, multi-user storage</div>
+      <div style="font-size:13px;line-height:1.7;color:var(--blue-dark)">
+        Once you set this up, anyone who opens your app can create their own PIN-locked profile, their data syncs across devices, and you (admin) can manage all profiles. <strong>Your users won't need to enter anything technical</strong> — no keys, no Client IDs.
+        <ol style="padding-left:20px;margin:12px 0 0;line-height:1.9">
+          <li>Create a free Firebase project at <a href="https://console.firebase.google.com" target="_blank" style="color:var(--blue);font-weight:700">console.firebase.google.com</a></li>
+          <li>Enable <strong>Firestore Database</strong> and <strong>Anonymous</strong> sign-in</li>
+          <li>Copy your <strong>API key</strong> and <strong>Project ID</strong> into <code style="background:#fff;padding:1px 6px;border-radius:4px">config.js</code></li>
+          <li>Commit — this page then becomes your shared-storage dashboard automatically</li>
+        </ol>
+        <div style="margin-top:12px;font-weight:600">Full step-by-step is in the README under "Shared storage (multi-user)".</div>
       </div>
     </div>
 
-    <div class="card" style="border-color:var(--purple)">
-      <div class="ct" style="margin-bottom:8px;color:var(--purple-dark)"><i class="ti ti-users" style="color:var(--purple)"></i> Want multiple people to share one storage?</div>
+    <div class="card">
+      <div class="ct" style="margin-bottom:8px"><i class="ti ti-device-laptop"></i> Just want it on your own devices?</div>
       <div style="font-size:13px;line-height:1.7;color:var(--text)">
-        The Google Drive sync above is for <strong>your own</strong> devices. To let several people each have their own PIN-locked profile in one shared database (with admin controls), set up <strong>Firebase shared storage</strong> — see the <strong>"Shared storage (multi-user)"</strong> section in the README. Once you add the Firebase details to <code style="background:var(--bg);padding:1px 5px;border-radius:4px">config.js</code>, this page switches to shared-storage mode automatically.
+        If you're the only user, you don't need any of this — your data is saved on this device automatically. Setting up Firebase (above) is only needed to share with other people or sync across your own devices.
       </div>
     </div>`;
-}
-
-function cloudSaveCid() {
-  const v = document.getElementById('cloud-cid').value.trim();
-  if (!v) { alert('Paste your OAuth Client ID.'); return; }
-  setClientId(v);
-  tokenClient = null; // re-init with new id
-  showToast('✅ Client ID saved!', 'green');
-  renderCloud();
-}
-
-async function cloudConnect() {
-  if (!getClientId()) { alert('Save your Client ID first.'); return; }
-  setSyncStatus('busy', 'Connecting…');
-  setDriveEnabled(true);
-  const ok = await driveSyncNow(true);
-  if (ok) { showToast('✅ Google Drive connected & synced!', 'green'); }
-  else { setDriveEnabled(false); }
-  renderCloud();
-}
-
-async function cloudSyncBtn() {
-  const ok = await driveSyncNow(true);
-  if (ok) showToast('✅ Synced!', 'green');
-  renderCloud();
-}
-
-function cloudDisconnect() {
-  if (!confirm('Turn off cloud sync? Your data stays on this device but will no longer sync.')) return;
-  setDriveEnabled(false);
-  accessToken = null; driveFileId = null;
-  setSyncStatus('off', 'Not synced');
-  showToast('Cloud sync turned off');
-  renderCloud();
 }
 
 /* ── INIT ── */
@@ -2095,13 +2037,8 @@ async function init() {
     goScr('profiles');
     return;
   }
-  // Local / Drive mode
-  if (driveEnabled() && getClientId()) {
-    setSyncStatus('on', lastSync() ? 'Synced ' + lastSync() : 'Sync ready');
-    setTimeout(() => driveSyncNow(false), 1500);
-  } else {
-    setSyncStatus('off', 'Not synced');
-  }
+  // Local mode (single device — no Firebase configured)
+  setSyncStatus('off', 'On this device');
   if (S.profiles.length && S.current && S.profiles.find(p => p.id === S.current)) {
     selProf(S.current);
   } else {
