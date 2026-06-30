@@ -427,6 +427,8 @@ function fbConfig() {
   return (f.apiKey && f.projectId) ? f : null;
 }
 function adminHash() { return cfg().adminCodeHash || ''; }
+function recoveryPub() { return (cfg().recovery && cfg().recovery.pubKey) || ''; }
+function recoveryPrivEnc() { return (cfg().recovery && cfg().recovery.privEnc) || ''; }
 function sharedMode() { return !!fbConfig(); }
 function b64FromBuf(buf) {
   const bytes = new Uint8Array(buf); let s = '';
@@ -467,6 +469,53 @@ async function sha256hex(s) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
+
+/* ── ADMIN PASSWORD RECOVERY (RSA escrow) ──
+   A public key (in config.js) encrypts a recovery copy of each profile's PIN.
+   Only the admin's private key — itself protected by the admin code — can decrypt it.
+   This lets admin reset a forgotten PIN while keeping the user's data. */
+async function genAdminKeypair() {
+  return crypto.subtle.generateKey(
+    { name: 'RSA-OAEP', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+    true, ['encrypt', 'decrypt']
+  );
+}
+async function exportPubKey(key) { return b64FromBuf(await crypto.subtle.exportKey('spki', key)); }
+async function importPubKey(b64) {
+  return crypto.subtle.importKey('spki', bufFromB64(b64), { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt']);
+}
+async function exportPrivKeyEnc(key, pass) {
+  const pk = await crypto.subtle.exportKey('pkcs8', key);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aes = await deriveAesKey(pass, salt, ['encrypt']);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aes, pk);
+  const out = new Uint8Array(16 + 12 + ct.byteLength);
+  out.set(salt, 0); out.set(iv, 16); out.set(new Uint8Array(ct), 28);
+  return b64FromBuf(out.buffer);
+}
+async function importPrivKeyEnc(b64, pass) {
+  const data = bufFromB64(b64);
+  const salt = data.slice(0, 16), iv = data.slice(16, 28), ct = data.slice(28);
+  const aes = await deriveAesKey(pass, salt, ['decrypt']);
+  const pk = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aes, ct);
+  return crypto.subtle.importKey('pkcs8', pk, { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['decrypt']);
+}
+async function rsaEncrypt(pubKey, text) {
+  const ct = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, pubKey, new TextEncoder().encode(text));
+  return b64FromBuf(ct);
+}
+async function rsaDecrypt(privKey, b64) {
+  const pt = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, privKey, bufFromB64(b64));
+  return new TextDecoder().decode(pt);
+}
+// Build the recovery blob for a PIN (or '' if recovery isn't configured)
+async function makeRecovery(pin) {
+  if (!pin || !recoveryPub()) return '';
+  try { return await rsaEncrypt(await importPubKey(recoveryPub()), pin); }
+  catch (e) { return ''; }
+}
+
 
 /* ══════════ FIREBASE (Firestore REST) — shared cloud storage ══════════ */
 // Profiles are stored in the OWNER's Firebase. Each profile's data is
@@ -829,8 +878,13 @@ async function load() {
 async function buildProfileDoc(p) {
   const payload = JSON.stringify({ profile: p, data: S.data[p.id] || { days: {} } });
   const doc = { name: p.name, locked: !!p.pin, updatedAt: Date.now(), createdAt: p.createdAt || Date.now() };
-  if (p.pin) doc.enc = await encryptKey(payload, p.pin);
-  else doc.data = payload; // not locked → stored as plain JSON string
+  if (p.pin) {
+    doc.enc = await encryptKey(payload, p.pin);
+    const rec = await makeRecovery(p.pin);
+    if (rec) doc.recovery = rec; // admin-resettable copy of the PIN
+  } else {
+    doc.data = payload; // not locked → stored as plain JSON string
+  }
   return doc;
 }
 
@@ -914,14 +968,31 @@ async function renderProfiles() {
       roster = await fbListProfiles();
       roster.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
       statusEl.innerHTML = `☁️ Shared storage · ${roster.length} profile${roster.length === 1 ? '' : 's'}`;
-      g.innerHTML = roster.map((p, i) =>
-        `<div class="ptile" onclick="pickProfile('${p.id}')">
-           <div class="pav" style="background:${colFor(i)}">${inits(p.name)}</div>
-           <div class="pn">${p.name} ${p.locked ? '<i class="ti ti-lock" style="font-size:11px;color:var(--muted)"></i>' : ''}</div>
-           <div class="pg">${adminMode ? '<span style="color:var(--red)">tap to delete</span>' : (p.locked ? 'Locked' : 'Open')}</div>
-         </div>`
-      ).join('') +
-      (adminMode ? '' : `<div class="ptile add-ptile" onclick="goScr('new')"><i class="ti ti-plus"></i><span>Add profile</span></div>`);
+      if (adminMode) {
+        // Admin: full-width rows with management buttons
+        g.style.gridTemplateColumns = '1fr';
+        g.innerHTML = roster.length === 0 ? '<div class="mini" style="text-align:center;padding:10px">No profiles yet.</div>' : roster.map((p, i) =>
+          `<div style="display:flex;align-items:center;gap:10px;border:1.5px solid var(--border);border-radius:10px;padding:10px 12px;background:#fff">
+             <div class="pav" style="width:36px;height:36px;background:${colFor(i)};flex-shrink:0">${inits(p.name)}</div>
+             <div style="flex:1;text-align:left;min-width:0">
+               <div style="font-size:13px;font-weight:700">${p.name}</div>
+               <div class="mini">${p.locked ? '🔒 Locked' : 'Open'} ${p.recovery ? '· resettable' : '· no recovery'}</div>
+             </div>
+             <button class="btn btn-o btn-sm" onclick="adminReset('${p.id}')"><i class="ti ti-key"></i> Reset PIN</button>
+             <button class="btn btn-d btn-sm" onclick="adminDelete('${p.id}')"><i class="ti ti-trash"></i></button>
+           </div>`
+        ).join('');
+      } else {
+        g.style.gridTemplateColumns = '';
+        g.innerHTML = roster.map((p, i) =>
+          `<div class="ptile" onclick="pickProfile('${p.id}')">
+             <div class="pav" style="background:${colFor(i)}">${inits(p.name)}</div>
+             <div class="pn">${p.name} ${p.locked ? '<i class="ti ti-lock" style="font-size:11px;color:var(--muted)"></i>' : ''}</div>
+             <div class="pg">${p.locked ? 'Locked' : 'Open'}</div>
+           </div>`
+        ).join('') +
+        `<div class="ptile add-ptile" onclick="goScr('new')"><i class="ti ti-plus"></i><span>Add profile</span></div>`;
+      }
     } catch (e) {
       statusEl.innerHTML = `<span style="color:var(--red)">Couldn't load shared storage: ${e.message}</span>`;
       g.innerHTML = `<div class="ptile add-ptile" onclick="goScr('new')"><i class="ti ti-plus"></i><span>Add profile</span></div>`;
@@ -930,7 +1001,7 @@ async function renderProfiles() {
     if (adminHash()) {
       adminEl.style.display = 'block';
       adminEl.innerHTML = adminMode
-        ? `<div style="text-align:center"><span class="bg bg-r" style="margin-bottom:8px;display:inline-block">⚙️ Admin mode — tap a profile to delete it</span><br><button class="btn btn-o btn-sm" style="margin-top:8px" onclick="exitAdmin()">Exit admin</button></div>`
+        ? `<div style="text-align:center"><span class="bg bg-r" style="margin-bottom:8px;display:inline-block">⚙️ Admin mode${recoveryPub() ? '' : ' — password recovery not set up (resets will clear data)'}</span><br><button class="btn btn-o btn-sm" style="margin-top:8px" onclick="exitAdmin()">Exit admin</button></div>`
         : `<div style="text-align:center"><button class="btn btn-o btn-sm" onclick="promptAdmin()"><i class="ti ti-shield-lock"></i> Admin login</button></div>`;
     } else {
       adminEl.style.display = 'none';
@@ -950,9 +1021,8 @@ async function renderProfiles() {
   `<div class="ptile add-ptile" onclick="goScr('new')"><i class="ti ti-plus"></i><span>Add profile</span></div>`;
 }
 
-/* Tap a profile: admin→delete, else unlock if needed, else open */
+/* Tap a profile: unlock if needed, else open (admin uses dedicated buttons) */
 async function pickProfile(pid) {
-  if (adminMode) { adminDelete(pid); return; }
   if (sharedMode()) {
     const meta = roster.find(p => p.id === pid);
     if (meta && meta.locked) { promptPin(pid, meta.name); return; }
@@ -1074,14 +1144,15 @@ function openProfileUI(pid) {
 }
 
 /* ── ADMIN ── */
+let adminCode = null; // kept in memory during an admin session (for recovery)
 async function promptAdmin() {
   const code = prompt('Enter the admin code:');
   if (code == null) return;
   const h = await sha256hex(code);
-  if (h === adminHash()) { adminMode = true; renderProfiles(); showToast('⚙️ Admin mode on'); }
+  if (h === adminHash()) { adminMode = true; adminCode = code; renderProfiles(); showToast('⚙️ Admin mode on'); }
   else alert('Wrong admin code.');
 }
-function exitAdmin() { adminMode = false; renderProfiles(); }
+function exitAdmin() { adminMode = false; adminCode = null; renderProfiles(); }
 async function adminDelete(pid) {
   const meta = roster.find(p => p.id === pid);
   if (!confirm(`ADMIN: permanently delete profile "${meta ? meta.name : pid}" and all its data? This cannot be undone.`)) return;
@@ -1090,6 +1161,61 @@ async function adminDelete(pid) {
     showToast('Profile deleted');
     renderProfiles();
   } catch (e) { alert('Delete failed: ' + e.message); }
+}
+
+/* Admin resets a forgotten PIN. Keeps data if recovery is set up; else clears it. */
+async function adminReset(pid) {
+  const meta = roster.find(p => p.id === pid);
+  const name = meta ? meta.name : pid;
+  let doc;
+  try { doc = await fbGetProfile(pid); } catch (e) { alert('Could not load profile: ' + e.message); return; }
+  if (!doc) { alert('Profile not found.'); return; }
+
+  const canRecover = doc.recovery && recoveryPub() && recoveryPrivEnc() && adminCode;
+
+  if (canRecover) {
+    // Recover old PIN, decrypt data, re-encrypt under a new temp PIN — data preserved.
+    let payload;
+    try {
+      const priv = await importPrivKeyEnc(recoveryPrivEnc(), adminCode);
+      const oldPin = await rsaDecrypt(priv, doc.recovery);
+      payload = JSON.parse(await decryptKey(doc.enc, oldPin));
+    } catch (e) {
+      alert('Recovery failed (admin code may be wrong, or recovery keys mismatch): ' + e.message);
+      return;
+    }
+    const newPin = prompt(`Set a NEW temporary unlock code for "${name}".\nTheir history will be kept. Give them this code; they can change it later in My Profile.`);
+    if (!newPin) return;
+    try {
+      payload.profile.pin = newPin;
+      const newDoc = { name: doc.name, locked: true, createdAt: doc.createdAt || Date.now(), updatedAt: Date.now() };
+      newDoc.enc = await encryptKey(JSON.stringify(payload), newPin);
+      const rec = await makeRecovery(newPin);
+      if (rec) newDoc.recovery = rec;
+      await fbSetProfile(pid, newDoc);
+      alert(`Done ✓\nProfile "${name}" — new unlock code: ${newPin}\n\nTheir data was kept. Share this code with them privately. They can change it in My Profile → Change unlock code.`);
+      renderProfiles();
+    } catch (e) { alert('Reset failed: ' + e.message); }
+    return;
+  }
+
+  // No recovery available → reset clears the data.
+  const why = !recoveryPub() ? 'Password recovery is not set up' : (!doc.recovery ? 'this profile was created before recovery was enabled' : 'missing keys');
+  if (!confirm(`Cannot recover "${name}" (${why}).\n\nReset will ERASE their history and set a new unlock code so they can start fresh. Continue?`)) return;
+  const newPin = prompt(`Set a new unlock code for "${name}" (their old data will be cleared):`);
+  if (!newPin) return;
+  try {
+    const freshProfile = { id: pid, name: doc.name, createdAt: doc.createdAt || Date.now(), pin: newPin,
+      age: 25, height: 170, weight: 70, sex: 'Other', act: 1.55, goal: 'Maintain weight', diet: 'Non-vegetarian', allergies: [], calTarget: 2000, tdee: 2000 };
+    const payload = { profile: freshProfile, data: { days: {} } };
+    const newDoc = { name: doc.name, locked: true, createdAt: doc.createdAt || Date.now(), updatedAt: Date.now() };
+    newDoc.enc = await encryptKey(JSON.stringify(payload), newPin);
+    const rec = await makeRecovery(newPin);
+    if (rec) newDoc.recovery = rec;
+    await fbSetProfile(pid, newDoc);
+    alert(`Done ✓\nProfile "${name}" was reset. New unlock code: ${newPin}\n\nTheir previous history was cleared. They can fill in their details again after logging in.`);
+    renderProfiles();
+  } catch (e) { alert('Reset failed: ' + e.message); }
 }
 
 /* ── NAV ── */
@@ -1733,6 +1859,16 @@ function renderProfile() {
         <button class="btn btn-d" onclick="delProfile()"><i class="ti ti-trash"></i> Delete profile</button>
       </div>
     </div>
+    ${sharedMode() && prof().pin ? `
+    <div class="card">
+      <div class="ct" style="margin-bottom:10px"><i class="ti ti-key"></i> Change unlock code</div>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Set a new PIN for this profile (e.g. after an admin reset gave you a temporary one).</p>
+      <div class="fg2">
+        <div class="fg"><label>New unlock code</label><input id="pe-newpin" type="password" placeholder="New PIN"></div>
+        <div class="fg"><label>Confirm new code</label><input id="pe-newpin2" type="password" placeholder="Re-enter"></div>
+      </div>
+      <button class="btn btn-o" onclick="changePin()"><i class="ti ti-refresh"></i> Update unlock code</button>
+    </div>` : ''}
     <div class="card" style="background:var(--blue-light);border-color:var(--blue)">
       <div class="ct" style="margin-bottom:12px;color:var(--blue-dark)"><i class="ti ti-calculator" style="color:var(--blue)"></i> Calculated targets</div>
       <div class="fg2">
@@ -1747,6 +1883,21 @@ function renderProfile() {
       </div>
       <div style="font-size:11px;color:var(--blue);margin-top:10px;opacity:.7">Harris-Benedict formula · updates when you save changes</div>
     </div>`;
+}
+
+async function changePin() {
+  const a = document.getElementById('pe-newpin').value;
+  const b = document.getElementById('pe-newpin2').value;
+  if (!a) { alert('Enter a new unlock code.'); return; }
+  if (a !== b) { alert('The two codes do not match.'); return; }
+  const p = prof();
+  p.pin = a; currentPin = a;
+  try {
+    await fbSetProfile(p.id, await buildProfileDoc(p));
+    showToast('✅ Unlock code updated!', 'green');
+    document.getElementById('pe-newpin').value = '';
+    document.getElementById('pe-newpin2').value = '';
+  } catch (e) { alert('Could not update: ' + e.message); }
 }
 
 function saveProfile() {
@@ -1963,10 +2114,15 @@ function renderSharedStorage() {
 
     <div class="card" style="border-color:var(--purple)">
       <div class="ct" style="margin-bottom:8px;color:var(--purple-dark)"><i class="ti ti-shield-cog" style="color:var(--purple)"></i> Owner / admin tools</div>
-      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Set an admin code to let yourself manage all profiles from the start screen. <button class="btn btn-o btn-sm" id="admin-gen-toggle" onclick="toggleAdminGen()">Set admin code</button></p>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Set an admin code to manage all profiles, and optionally enable password reset for forgotten PINs. <button class="btn btn-o btn-sm" id="admin-gen-toggle" onclick="toggleAdminGen()">Set up admin</button></p>
       <div id="admin-gen" style="display:none">
         <div class="fg"><label>Choose an admin code</label><input id="admin-code-in" placeholder="A strong code only you know"></div>
-        <button class="btn btn-p" onclick="genAdminConfig()"><i class="ti ti-lock"></i> Generate admin config line</button>
+        <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:var(--text);margin-bottom:12px;cursor:pointer">
+          <input type="checkbox" id="admin-recovery-chk" checked style="width:auto;margin-top:2px">
+          <span>Enable <b>password reset</b> — lets you restore access if a user forgets their PIN, keeping their data.
+          <span style="color:var(--amber-dark)">Note: this means admin can also recover/read profile data (unavoidable for keep-data resets).</span></span>
+        </label>
+        <button class="btn btn-p" onclick="genAdminConfig()"><i class="ti ti-lock"></i> Generate config</button>
         <div id="admin-gen-out" style="margin-top:12px"></div>
       </div>
     </div>`;
@@ -1976,19 +2132,29 @@ function toggleAdminGen() {
   const el = document.getElementById('admin-gen');
   const show = el.style.display === 'none';
   el.style.display = show ? 'block' : 'none';
-  document.getElementById('admin-gen-toggle').textContent = show ? 'Hide' : 'Set admin code';
+  document.getElementById('admin-gen-toggle').textContent = show ? 'Hide' : 'Set up admin';
 }
 async function genAdminConfig() {
   const code = document.getElementById('admin-code-in').value.trim();
+  const withRecovery = document.getElementById('admin-recovery-chk').checked;
   const out = document.getElementById('admin-gen-out');
   if (code.length < 4) { alert('Choose an admin code of at least 4 characters.'); return; }
+  out.innerHTML = `<div class="loading"><div class="spin"></div> Generating${withRecovery ? ' keys (a few seconds)…' : '…'}</div>`;
   const h = await sha256hex(code);
+  let recoveryLines = '', recoveryBlock = '';
+  if (withRecovery) {
+    const kp = await genAdminKeypair();
+    const pub = await exportPubKey(kp.publicKey);
+    const priv = await exportPrivKeyEnc(kp.privateKey, code);
+    recoveryBlock = `,\n  recovery: {\n    pubKey: "${pub}",\n    privEnc: "${priv}"\n  }`;
+    recoveryLines = ' + password reset';
+  }
+  const full = `window.FITTRACK_CONFIG = {\n  geminiBlob: ${JSON.stringify(cfg().geminiBlob || '')},\n  firebase: ${JSON.stringify(cfg().firebase || { apiKey: '', projectId: '' })},\n  adminCodeHash: "${h}"${recoveryBlock}\n};`;
   out.innerHTML = `
-    <div class="notice notice-b" style="margin-bottom:10px"><i class="ti ti-circle-check" style="font-size:18px"></i> Done. Put this in config.js (inside FITTRACK_CONFIG), then commit.</div>
-    <div style="font-size:13px;font-weight:700;margin-bottom:6px">Set <code style="background:var(--bg);padding:1px 5px;border-radius:4px">adminCodeHash</code> to:</div>
-    <textarea readonly id="admin-hash-text" style="width:100%;min-height:60px;font-family:monospace;font-size:11px;padding:10px;border:2px solid var(--purple);border-radius:8px;background:#fff;resize:vertical">"${h}"</textarea>
-    <button class="btn btn-o btn-sm" style="margin-top:8px" onclick="navigator.clipboard.writeText(document.getElementById('admin-hash-text').value);showToast('Copied!')"><i class="ti ti-copy"></i> Copy</button>
-    <div style="font-size:12px;color:var(--muted);margin-top:10px">After committing, open the start screen → "Admin login" → enter your code to see and delete any profile. The code itself is never stored — only this hash.</div>`;
+    <div class="notice notice-b" style="margin-bottom:10px"><i class="ti ti-circle-check" style="font-size:18px"></i> Admin${recoveryLines} ready. Replace the whole contents of <code>config.js</code> with the block below, then commit.</div>
+    <textarea readonly id="admin-cfg-text" style="width:100%;min-height:150px;font-family:monospace;font-size:10px;padding:10px;border:2px solid var(--purple);border-radius:8px;background:#fff;resize:vertical">${full.replace(/</g, '&lt;')}</textarea>
+    <button class="btn btn-o btn-sm" style="margin-top:8px" onclick="navigator.clipboard.writeText(document.getElementById('admin-cfg-text').value);showToast('Copied!')"><i class="ti ti-copy"></i> Copy whole config</button>
+    <div style="font-size:12px;color:var(--muted);margin-top:10px">After committing, open the start screen → "Admin login" → enter your code (<code>${code}</code>). ${withRecovery ? 'You can then Reset PIN on any profile and keep its data.' : 'Resets will clear data since recovery is off.'} The code itself is never stored — only its hash.</div>`;
 }
 
 function renderCloud() {
