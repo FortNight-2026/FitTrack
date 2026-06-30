@@ -22,5 +22,5 @@ window.FITTRACK_CONFIG = {
 
   // 3) ADMIN CODE (lets you see & delete all profiles)
   //    Generated in: Shared storage → "Set admin code"
-  adminCodeHash: ""
+  adminCodeHash: "1133226599cc17c8b4ee08a06e05ba8dcd31d4a7539a4b4198ef6f1bb77b3d64"
 };
