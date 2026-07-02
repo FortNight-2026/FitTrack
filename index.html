@@ -138,6 +138,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif
 .lrow:last-child { border-bottom:none; padding-bottom:0; }
 .lrow:first-child { padding-top:0; }
 .rn { font-size:13px; font-weight:600; }
+.rtime { display:inline-block; font-size:11px; font-weight:700; color:var(--blue-dark); background:var(--blue-light); padding:1px 6px; border-radius:5px; margin-right:2px; vertical-align:middle; }
 .rs { font-size:11px; color:var(--muted); margin-top:2px; }
 .rr { display:flex; align-items:center; gap:8px; }
 
@@ -963,6 +964,14 @@ let viewDate = tday();
 let activePage = 'dashboard';
 
 function tday() { return new Date().toISOString().split('T')[0]; }
+function nowHM() { const d = new Date(); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+function fmtTime(hm) {
+  if (!hm) return '';
+  const [h, m] = hm.split(':').map(Number);
+  const ap = h < 12 ? 'AM' : 'PM';
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return h12 + ':' + String(m).padStart(2, '0') + ' ' + ap;
+}
 function fmtFull(d) { return new Date(d + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }); }
 function fmtS(d) {
   const t = tday();
@@ -1443,12 +1452,12 @@ function renderDash() {
       ${d.food.length === 0
         ? `<div class="empty"><i class="ti ti-apple"></i><p>${isToday ? 'Tap "Add food" to log your meals' : 'No food logged this day'}</p></div>`
         : ['Breakfast','Lunch','Dinner','Snack'].map(meal => {
-            const items = d.food.filter(f => f.meal === meal); if (!items.length) return '';
+            const items = d.food.filter(f => f.meal === meal).sort((a,b)=>(a.time||'').localeCompare(b.time||'')); if (!items.length) return '';
             const mc = items.reduce((s,f)=>s+(f.calories||0),0);
             return `<div class="mgrp">
               <div class="mlbl"><span>${MEAL_ICONS[meal]} ${meal}</span><span class="bg bg-b">${mc} kcal</span></div>
               ${items.map(f=>`<div class="lrow">
-                <div><div class="rn">${f.name}</div><div class="rs">${f.serving||''}${f.protein?' · P:'+f.protein+'g':''}${f.carbs?' C:'+f.carbs+'g':''}${f.fat?' F:'+f.fat+'g':''}</div></div>
+                <div><div class="rn">${f.time ? '<span class="rtime">'+fmtTime(f.time)+'</span> ' : ''}${f.name}</div><div class="rs">${f.serving||''}${f.protein?' · P:'+f.protein+'g':''}${f.carbs?' C:'+f.carbs+'g':''}${f.fat?' F:'+f.fat+'g':''}</div></div>
                 <span class="bg bg-b">${f.calories} kcal</span>
               </div>`).join('')}
             </div>`;
@@ -1462,8 +1471,8 @@ function renderDash() {
       </div>
       ${d.exercise.length === 0
         ? `<div class="empty"><i class="ti ti-run"></i><p>${isToday ? 'Tap "Log exercise" to track your workout' : 'No exercise this day'}</p></div>`
-        : d.exercise.map(e=>`<div class="lrow">
-            <div><div class="rn">${e.name}</div><div class="rs">${e.duration} min · ${e.intensity}${e.notes?' · '+e.notes:''}</div></div>
+        : d.exercise.slice().sort((a,b)=>(a.time||'').localeCompare(b.time||'')).map(e=>`<div class="lrow">
+            <div><div class="rn">${e.time ? '<span class="rtime">'+fmtTime(e.time)+'</span> ' : ''}${e.name}</div><div class="rs">${e.duration} min · ${e.intensity}${e.notes?' · '+e.notes:''}</div></div>
             <span class="bg bg-g">-${e.calBurned} kcal</span>
           </div>`).join('')}
     </div>`;
@@ -1501,13 +1510,14 @@ function renderFood() {
           <label>Meal</label>
           <select id="fi-meal"><option>Breakfast</option><option selected>Lunch</option><option>Dinner</option><option>Snack</option></select>
         </div>
-        <div class="fg" style="justify-content:flex-end">
-          <label>&nbsp;</label>
-          <div class="bgrp">
-            <button class="btn btn-p" onclick="lookupFood()"><i class="ti ti-sparkles"></i> Look up nutrition</button>
-            <button class="btn btn-o" onclick="toggleManual('manual-food','manual-food-toggle')"><i class="ti ti-pencil"></i> Manual</button>
-          </div>
+        <div class="fg">
+          <label>Time</label>
+          <input type="time" id="fi-time" value="${nowHM()}">
         </div>
+      </div>
+      <div class="bgrp" style="margin-bottom:14px">
+        <button class="btn btn-p" onclick="lookupFood()"><i class="ti ti-sparkles"></i> Look up nutrition</button>
+        <button class="btn btn-o" onclick="toggleManual('manual-food','manual-food-toggle')"><i class="ti ti-pencil"></i> Manual</button>
       </div>
       <div id="manual-food" style="display:none">
         <hr>
@@ -1539,13 +1549,13 @@ function renderFood() {
       ${d.food.length === 0
         ? `<div class="empty"><i class="ti ti-apple"></i><p>Nothing logged yet for this day</p></div>`
         : ['Breakfast','Lunch','Dinner','Snack'].map(meal => {
-            const items = d.food.filter(f => f.meal === meal); if (!items.length) return '';
+            const items = d.food.filter(f => f.meal === meal).sort((a,b)=>(a.time||'').localeCompare(b.time||'')); if (!items.length) return '';
             const mc = items.reduce((s,f)=>s+(f.calories||0),0);
             return `<div class="mgrp">
               <div class="mlbl"><span>${MEAL_ICONS[meal]} ${meal}</span><span class="bg bg-b">${mc} kcal</span></div>
               ${items.map(f=>`<div class="lrow">
                 <div>
-                  <div class="rn">${f.name}</div>
+                  <div class="rn">${f.time ? '<span class="rtime">'+fmtTime(f.time)+'</span> ' : ''}${f.name}</div>
                   <div class="rs">${f.serving||'1 serving'}${f.protein?' · Protein: '+f.protein+'g':''}${f.carbs?' · Carbs: '+f.carbs+'g':''}${f.fat?' · Fat: '+f.fat+'g':''}</div>
                 </div>
                 <div class="rr">
@@ -1625,6 +1635,7 @@ All numbers must be integers. Be accurate.`;
 function confirmFood(food) {
   if (typeof food === 'string') food = JSON.parse(food);
   food.meal = document.getElementById('fi-meal').value;
+  food.time = document.getElementById('fi-time').value || '';
   cur().food.push(food); save();
   document.getElementById('fi-name').value = '';
   document.getElementById('fi-qty').value = '';
@@ -1639,6 +1650,7 @@ function addFoodManual() {
   const food = {
     name, serving: qty,
     meal: document.getElementById('fi-meal').value,
+    time: document.getElementById('fi-time').value || '',
     calories: parseInt(document.getElementById('fm-cal').value) || 0,
     protein:  parseInt(document.getElementById('fm-pro').value) || 0,
     carbs:    parseInt(document.getElementById('fm-carb').value) || 0,
@@ -1680,6 +1692,10 @@ function renderEx() {
         </div>
         <div class="fg"><label>Notes (optional)</label><input id="ex-notes" placeholder="How did it feel?"></div>
       </div>
+      <div class="fg2" style="margin-bottom:14px">
+        <div class="fg"><label>Time</label><input type="time" id="ex-time" value="${nowHM()}"></div>
+        <div class="fg"></div>
+      </div>
       <div class="bgrp">
         <button class="btn btn-p" onclick="lookupEx()"><i class="ti ti-sparkles"></i> Calculate calories burned</button>
         <button class="btn btn-o" onclick="toggleManual('manual-ex')"><i class="ti ti-pencil"></i> Enter manually</button>
@@ -1703,8 +1719,8 @@ function renderEx() {
       <div class="ch"><div class="ct"><i class="ti ti-list"></i> Exercise log — ${fmtS(viewDate)}</div></div>
       ${d.exercise.length === 0
         ? `<div class="empty"><i class="ti ti-run"></i><p>No exercise logged yet</p></div>`
-        : d.exercise.map((e,i) => `<div class="lrow">
-            <div><div class="rn">${e.name}</div><div class="rs">${e.duration} min · ${e.intensity}${e.notes?' · '+e.notes:''}</div></div>
+        : d.exercise.map((e,i)=>({e,i})).sort((a,b)=>(a.e.time||'').localeCompare(b.e.time||'')).map(({e,i}) => `<div class="lrow">
+            <div><div class="rn">${e.time ? '<span class="rtime">'+fmtTime(e.time)+'</span> ' : ''}${e.name}</div><div class="rs">${e.duration} min · ${e.intensity}${e.notes?' · '+e.notes:''}</div></div>
             <div class="rr">
               <span class="bg bg-g">-${e.calBurned} kcal</span>
               <button class="btn btn-ic btn-d btn-sm" onclick="removeEx(${i})"><i class="ti ti-x"></i></button>
@@ -1755,7 +1771,8 @@ Return ONLY valid JSON, no markdown:
 
 function confirmEx(name, duration, intensity, calBurned) {
   const notes = document.getElementById('ex-notes').value.trim();
-  cur().exercise.push({ name, duration, intensity, calBurned, notes }); save();
+  const time = document.getElementById('ex-time').value || '';
+  cur().exercise.push({ name, duration, intensity, calBurned, notes, time }); save();
   document.getElementById('ex-name').value = '';
   document.getElementById('ex-dur').value = '';
   document.getElementById('ex-notes').value = '';
@@ -1769,7 +1786,8 @@ function addExManual() {
   const intens = document.getElementById('ex-int').value;
   const calBurned = parseInt(document.getElementById('em-cal').value) || 0;
   const notes = document.getElementById('ex-notes').value.trim();
-  cur().exercise.push({ name, duration: dur, intensity: intens, calBurned, notes }); save();
+  const time = document.getElementById('ex-time').value || '';
+  cur().exercise.push({ name, duration: dur, intensity: intens, calBurned, notes, time }); save();
   document.getElementById('ex-name').value = '';
   document.getElementById('manual-ex').style.display = 'none';
   showToast('✅ ' + name + ' logged!', 'green');
@@ -1781,7 +1799,7 @@ function removeEx(i) { cur().exercise.splice(i,1); save(); showToast('Removed');
 function renderWt() {
   const p = prof(), bmi = bmiVal(), bc = bmi ? bmiCat(bmi) : null;
   const d = S.data[S.current] || { days:{} };
-  const hist = Object.keys(d.days).sort().filter(dt => d.days[dt].weight).map(dt => ({ dt, w: d.days[dt].weight }));
+  const hist = Object.keys(d.days).sort().filter(dt => d.days[dt].weight).map(dt => ({ dt, w: d.days[dt].weight, time: d.days[dt].weightTime }));
 
   document.getElementById('page-weight').innerHTML = `
     <div class="ph"><h2>⚖️ Weight &amp; BMI</h2><p>Track your weight and monitor BMI over time</p></div>
@@ -1793,6 +1811,10 @@ function renderWt() {
       <div class="fg2">
         <div class="fg"><label>Weight (kg)</label><input id="w-val" type="number" step="0.1" placeholder="${lastWt()||70}" value="${cur().weight||''}"></div>
         <div class="fg"><label>Height (cm)</label><input id="w-ht" type="number" value="${p.height||''}" placeholder="170"></div>
+      </div>
+      <div class="fg2">
+        <div class="fg"><label>Time</label><input type="time" id="w-time" value="${cur().weightTime || nowHM()}"></div>
+        <div class="fg"></div>
       </div>
       <button class="btn btn-p" onclick="saveWt()"><i class="ti ti-check"></i> Save weight</button>
     </div>
@@ -1834,7 +1856,7 @@ function renderWt() {
             const delta = prev ? (w.w - prev.w).toFixed(1) : null;
             const bw = p.height ? (w.w/(p.height/100)**2).toFixed(1) : null;
             return `<div class="wrow">
-              <div><div style="font-size:13px;font-weight:600">${fmtFull(w.dt)}</div>${bw?`<div style="font-size:11px;color:var(--muted)">BMI ${bw}</div>`:''}</div>
+              <div><div style="font-size:13px;font-weight:600">${fmtFull(w.dt)}${w.time ? ' · ' + fmtTime(w.time) : ''}</div>${bw?`<div style="font-size:11px;color:var(--muted)">BMI ${bw}</div>`:''}</div>
               <div style="display:flex;align-items:center;gap:10px">
                 ${delta!==null?`<span style="font-size:12px;font-weight:700;color:${parseFloat(delta)>0?'var(--red)':parseFloat(delta)<0?'var(--green)':'var(--muted)'}">${parseFloat(delta)>0?'▲':parseFloat(delta)<0?'▼':'='} ${Math.abs(delta)}kg</span>`:''}
                 <span style="font-size:16px;font-weight:800">${w.w} kg</span>
@@ -1849,7 +1871,10 @@ function saveWt() {
   if (!v || v < 20 || v > 300) { alert('Enter a valid weight (20–300 kg)'); return; }
   const htEl = document.getElementById('w-ht');
   if (htEl?.value) { prof().height = parseFloat(htEl.value); }
-  cur().weight = v; save();
+  const tEl = document.getElementById('w-time');
+  cur().weight = v;
+  cur().weightTime = tEl ? tEl.value : '';
+  save();
   showToast('✅ Weight saved!', 'green'); renderWt();
 }
 
